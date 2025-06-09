@@ -16,6 +16,21 @@ from jellyfin_core import (
 )
 from vars import JELLYFIN_URL, JELLYFIN_API_KEY, JELLYFIN_USER_ID
 
+# Extend MediaItem to support episode metadata
+def extend_media_item():
+    """Add episode-specific attributes to MediaItem instances"""
+    def add_episode_attrs(self, parent_id=None, series_id=None, 
+                         episode_number=None, season_number=None):
+        self.parent_id = parent_id
+        self.series_id = series_id
+        self.episode_number = episode_number
+        self.season_number = season_number
+    
+    MediaItem.add_episode_attrs = add_episode_attrs
+
+extend_media_item()
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +56,9 @@ class CleanupResult:
     items_skipped: int
     items_failed: int
     provider_ids_removed: int
+    episodes_processed: int = 0
+    episodes_cleaned: int = 0
+    episodes_failed: int = 0
 
 
 class AnimeLibraryDetector:
@@ -155,12 +173,13 @@ class AnimeProviderCleaner:
         
         return self._anime_libraries
     
-    def get_media_items_by_library(self, library_id: str) -> List[MediaItem]:
+    def get_media_items_by_library(self, library_id: str, include_episodes: bool = True) -> List[MediaItem]:
         """
         Get media items from a specific library.
         
         Args:
             library_id: Library ID to query
+            include_episodes: Whether to include individual episodes
             
         Returns:
             List of MediaItem objects from the library
@@ -168,13 +187,17 @@ class AnimeProviderCleaner:
         user = self.media_library.primary_user
         all_items = []
         
-        for media_type in [MediaType.MOVIE, MediaType.SERIES]:
+        media_types = [MediaType.MOVIE, MediaType.SERIES]
+        if include_episodes:
+            media_types.append(MediaType.EPISODE)
+        
+        for media_type in media_types:
             try:
                 params = {
                     "ParentId": library_id,
                     "IncludeItemTypes": media_type.value,
                     "Recursive": "true",
-                    "Fields": "ProviderIds"
+                    "Fields": "ProviderIds,ParentId,SeriesId"
                 }
                 
                 response = self.api._make_request(
@@ -192,6 +215,14 @@ class AnimeProviderCleaner:
                         media_type=media_type,
                         provider_ids=item_data.get("ProviderIds", {})
                     )
+                    
+                    # Add additional metadata for episodes
+                    if media_type == MediaType.EPISODE:
+                        media_item.parent_id = item_data.get("ParentId")
+                        media_item.series_id = item_data.get("SeriesId")
+                        media_item.episode_number = item_data.get("IndexNumber")
+                        media_item.season_number = item_data.get("ParentIndexNumber")
+                    
                     all_items.append(media_item)
                 
             except JellyfinAPIError as e:
@@ -199,6 +230,56 @@ class AnimeProviderCleaner:
                 continue
         
         return all_items
+    
+    def get_episodes_for_series(self, series_id: str) -> List[MediaItem]:
+        """
+        Get all episodes for a specific TV series.
+        
+        Args:
+            series_id: Series ID to get episodes for
+            
+        Returns:
+            List of episode MediaItem objects
+        """
+        user = self.media_library.primary_user
+        episodes = []
+        
+        try:
+            params = {
+                "ParentId": series_id,
+                "IncludeItemTypes": "Episode",
+                "Recursive": "true",
+                "Fields": "ProviderIds,ParentId,SeriesId,IndexNumber,ParentIndexNumber"
+            }
+            
+            response = self.api._make_request(
+                'GET', 
+                f'/Users/{user.id}/Items', 
+                params=params
+            )
+            
+            items_data = response.json().get("Items", [])
+            
+            for item_data in items_data:
+                episode = MediaItem(
+                    id=item_data["Id"],
+                    name=item_data.get("Name", "Unknown"),
+                    media_type=MediaType.EPISODE,
+                    provider_ids=item_data.get("ProviderIds", {})
+                )
+                
+                # Add episode-specific metadata
+                episode.parent_id = item_data.get("ParentId")  # Season ID
+                episode.series_id = item_data.get("SeriesId")
+                episode.episode_number = item_data.get("IndexNumber")
+                episode.season_number = item_data.get("ParentIndexNumber")
+                
+                episodes.append(episode)
+                
+        except JellyfinAPIError as e:
+            logger.error(f"Failed to get episodes for series {series_id}: {e}")
+        
+        return episodes
     
     def get_non_anime_items_with_anime_providers(self) -> List[MediaItem]:
         """
@@ -280,12 +361,70 @@ class AnimeProviderCleaner:
             logger.error(f"Failed to clean provider IDs from {item.name}: {e}")
             return False, 0
     
-    def run_cleanup(self, dry_run: bool = False) -> CleanupResult:
+    def clean_episodes_for_series(self, series: MediaItem, dry_run: bool = False) -> Tuple[int, int, int]:
+        """
+        Clean anime provider IDs from all episodes of a series.
+        
+        Args:
+            series: Series MediaItem
+            dry_run: If True, only report what would be cleaned
+            
+        Returns:
+            Tuple of (episodes_cleaned, episodes_skipped, episodes_failed)
+        """
+        episodes = self.get_episodes_for_series(series.id)
+        anime_filter = AnimeProviderFilter()
+        
+        episodes_with_anime_ids = [
+            ep for ep in episodes 
+            if anime_filter.should_include(ep)
+        ]
+        
+        if not episodes_with_anime_ids:
+            logger.debug(f"No episodes with anime provider IDs found for series: {series.name}")
+            return 0, 0, 0
+        
+        logger.info(f"Found {len(episodes_with_anime_ids)} episodes with anime provider IDs in series: {series.name}")
+        
+        cleaned = 0
+        skipped = 0
+        failed = 0
+        
+        for episode in episodes_with_anime_ids:
+            anime_provider_ids = anime_filter.get_anime_provider_ids(episode)
+            episode_identifier = f"S{episode.season_number or '?'}E{episode.episode_number or '?'} - {episode.name}"
+            
+            logger.info(f"  Processing episode: {episode_identifier}")
+            logger.debug(f"    Anime provider IDs to remove: {list(anime_provider_ids.keys())}")
+            
+            if dry_run:
+                cleaned += 1
+                logger.info(f"    [DRY RUN] Would remove {len(anime_provider_ids)} provider IDs")
+            else:
+                success, ids_removed = self.remove_anime_provider_ids(episode)
+                
+                if success:
+                    if ids_removed > 0:
+                        cleaned += 1
+                        logger.info(f"    Cleaned {ids_removed} anime provider IDs")
+                    else:
+                        skipped += 1
+                        logger.debug(f"    No changes needed")
+                else:
+                    failed += 1
+                    logger.error(f"    Failed to clean episode")
+        
+        return cleaned, skipped, failed
+    
+    def run_cleanup(self, dry_run: bool = False, include_episodes: bool = True, 
+                   clean_series_episodes: bool = True) -> CleanupResult:
         """
         Run the cleanup process to remove anime provider IDs from non-anime items.
         
         Args:
             dry_run: If True, only report what would be cleaned without making changes
+            include_episodes: Whether to include individual episodes in cleanup
+            clean_series_episodes: Whether to clean episodes for series that have anime provider IDs
             
         Returns:
             CleanupResult with operation statistics
@@ -304,7 +443,7 @@ class AnimeProviderCleaner:
         
         logger.info(f"Found {len(items_to_clean)} items that need cleaning")
         
-        # Process each item
+        # Initialize result
         result = CleanupResult(
             total_items_processed=len(items_to_clean),
             items_cleaned=0,
@@ -313,6 +452,7 @@ class AnimeProviderCleaner:
             provider_ids_removed=0
         )
         
+        # Process each item
         for item in items_to_clean:
             anime_filter = AnimeProviderFilter()
             anime_provider_ids = anime_filter.get_anime_provider_ids(item)
@@ -335,7 +475,14 @@ class AnimeProviderCleaner:
                         result.items_skipped += 1
                 else:
                     result.items_failed += 1
-                   
+            
+            # Clean episodes for series if requested
+            if clean_series_episodes and item.media_type == MediaType.SERIES:
+                logger.info(f"Cleaning episodes for series: {item.name}")
+                ep_cleaned, ep_skipped, ep_failed = self.clean_episodes_for_series(item, dry_run)
+                result.episodes_processed += ep_cleaned + ep_skipped + ep_failed
+                result.episodes_cleaned += ep_cleaned
+                result.episodes_failed += ep_failed
         
         # Log results
         logger.info("Cleanup completed!")
@@ -344,6 +491,11 @@ class AnimeProviderCleaner:
         logger.info(f"Items skipped: {result.items_skipped}")
         logger.info(f"Items failed: {result.items_failed}")
         logger.info(f"Provider IDs removed: {result.provider_ids_removed}")
+        
+        if clean_series_episodes:
+            logger.info(f"Episodes processed: {result.episodes_processed}")
+            logger.info(f"Episodes cleaned: {result.episodes_cleaned}")
+            logger.info(f"Episodes failed: {result.episodes_failed}")
         
         return result
 
@@ -358,7 +510,6 @@ def main():
     )
     parser.add_argument(
         '--base-url', 
-#         required=True,
         help='Jellyfin server URL (e.g., http://localhost:8096)'
     )
     parser.add_argument(
@@ -369,6 +520,16 @@ def main():
         '--dry-run',
         action='store_true',
         help='Show what would be cleaned without making changes'
+    )
+    parser.add_argument(
+        '--skip-episodes',
+        action='store_true',
+        help='Skip cleaning individual episodes (only clean series and movies)'
+    )
+    parser.add_argument(
+        '--skip-series-episodes',
+        action='store_true',
+        help='Skip cleaning episodes for series that have anime provider IDs'
     )
     parser.add_argument(
         '--verbose',
@@ -382,33 +543,37 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Get API key
+    # Get API key and URL
     api_key = args.api_key or JELLYFIN_API_KEY
     base_url = args.base_url or JELLYFIN_URL
+    
     if not api_key:
         logger.error("API key is required. Use --api-key or set JELLYFIN_API_KEY environment variable")
         return 1
     if not base_url:
-        logger.error("URL is required. Use --api-key or set JELLYFIN_API_KEY environment variable")
+        logger.error("Base URL is required. Use --base-url or set JELLYFIN_URL environment variable")
         return 1    
+    
     try:
         # Create media library instance
         media_library = create_media_library(base_url, api_key)
         
         # Create cleaner and run
         cleaner = AnimeProviderCleaner(media_library.api)
-        result = cleaner.run_cleanup(dry_run=args.dry_run)
+        result = cleaner.run_cleanup(
+            dry_run=args.dry_run,
+            include_episodes=not args.skip_episodes,
+            clean_series_episodes=not args.skip_series_episodes
+        )
         
         # Return appropriate exit code
-        return 0 if result.items_failed == 0 else 1
+        return 0 if (result.items_failed == 0 and result.episodes_failed == 0) else 1
         
     except JellyfinAPIError as e:
         logger.error(f"Jellyfin API error: {e}")
         return 1
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        raise e
-    finally:
         return 1
 
 

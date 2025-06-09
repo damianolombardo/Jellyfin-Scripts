@@ -20,6 +20,7 @@ class MediaType(Enum):
     """Enumeration of supported media types"""
     MOVIE = "Movie"
     SERIES = "Series"
+    EPISODE = "EPISODE"
     
 
 class JellyfinAPIError(Exception):
