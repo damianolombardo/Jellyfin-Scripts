@@ -1,18 +1,27 @@
-import requests
+"""
+Common Sense Media Ratings Updater
+
+This script fetches Common Sense Media ratings from MDBList API and updates
+Jellyfin media items using the Jellyfin Core API module.
+"""
+
 import time
 import logging
-import json
-import os
-from typing import Dict, List, Optional, Tuple, Generator
+from typing import Dict, List, Optional, Generator
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
+import requests
+
+# Import the Jellyfin Core API module
+from jellyfin_core_api import (
+    JellyfinAPI, MediaLibrary, MediaType, MediaItem, MediaFilter,
+    ProviderIDFilter, create_media_library, JellyfinAPIError
+)
 from vars import JELLYFIN_URL, JELLYFIN_API_KEY, MDBLIST_API_KEY
 
 # Configuration
-CUSTOM_RATING_FIELD = "CustomRating"
 LOG_FILE = "commonsense_ratings_log.txt"
-PROVIDER_PRIORITY = ['Imdb', 'Tmdb', 'Trakt', 'Tvdb']
 BATCH_SIZE = 200
 REQUEST_DELAY = 1  # seconds between API requests
 
@@ -28,156 +37,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class MediaType(Enum):
-    MOVIE = "Movie"
-    SERIES = "Series"
-
-
-@dataclass
-class MediaData:
-    """Container for media information (movies or TV series)"""
-    id: str
-    name: str
-    media_type: MediaType
-    provider: str
-    external_id: str
-    custom_rating: Optional[str] = None
-
-
 @dataclass
 class CommonSenseRating:
     """Container for Common Sense Media rating information"""
     commonsense: Optional[str] = None
     age_rating: Optional[str] = None
-
-
-class JellyfinAPI:
-    """Handles Jellyfin API interactions for Common Sense ratings"""
-    
-    def __init__(self, url: str, api_key: str):
-        self.url = url.rstrip('/')
-        self.headers = {
-            'X-Emby-Token': api_key,
-            'Content-Type': 'application/json'
-        }
-    
-    def get_user_id(self) -> str:
-        """Get the first user ID from Jellyfin"""
-        try:
-            response = requests.get(f"{self.url}/Users", headers=self.headers)
-            response.raise_for_status()
-            users = response.json()
-            if not users:
-                raise ValueError("No users found in Jellyfin")
-            return users[0]["Id"]
-        except requests.RequestException as e:
-            logger.error(f"Failed to get user ID: {e}")
-            raise
-    
-    def get_all_media(self, user_id: str, media_types: List[MediaType]) -> Tuple[Dict[str, MediaData], List[str]]:
-        """Fetch all media (movies/series) and categorize them by available provider IDs"""
-        all_media_with_ids = {}
-        all_media_missing_ids = []
-        
-        for media_type in media_types:
-            logger.info(f"Fetching {media_type.value.lower()}s...")
-            media_with_ids, media_missing_ids = self._get_media_by_type(user_id, media_type)
-            all_media_with_ids.update(media_with_ids)
-            all_media_missing_ids.extend(media_missing_ids)
-        
-        return all_media_with_ids, all_media_missing_ids
-    
-    def _get_media_by_type(self, user_id: str, media_type: MediaType) -> Tuple[Dict[str, MediaData], List[str]]:
-        """Fetch media of a specific type"""
-        url = f"{self.url}/Users/{user_id}/Items"
-        params = {
-            "IncludeItemTypes": media_type.value,
-            "Recursive": "true",
-            "Fields": "ProviderIds,CustomRating"
-        }
-        
-        try:
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            items = response.json().get("Items", [])
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch {media_type.value.lower()}s: {e}")
-            raise
-        
-        media_with_ids = {}
-        media_missing_ids = []
-        used_ids = set()
-        
-        for item in items:
-            provider_ids = item.get("ProviderIds", {})
-            media_name = item.get("Name", "Unknown")
-            
-            # Find the first available provider ID in priority order
-            selected_provider = None
-            selected_id = None
-            
-            for provider in PROVIDER_PRIORITY:
-                pid = provider_ids.get(provider)
-                if pid and pid not in used_ids:
-                    selected_provider = provider.lower()
-                    selected_id = pid
-                    used_ids.add(pid)
-                    break
-            
-            if selected_provider and selected_id:
-                media_with_ids[item["Id"]] = MediaData(
-                    id=item["Id"],
-                    name=media_name,
-                    media_type=media_type,
-                    provider=selected_provider,
-                    external_id=selected_id,
-                    custom_rating=item.get("CustomRating")
-                )
-            else:
-                media_missing_ids.append(media_name)
-        
-        return media_with_ids, media_missing_ids
-    
-    def update_commonsense_rating(self, item_id: str, user_id: str, 
-                                 commonsense_rating: Optional[str] = None) -> Tuple[bool, bool]:
-        """Update Common Sense rating in Jellyfin only if value has changed
-        
-        Returns:
-            Tuple[bool, bool]: (success, was_updated)
-        """
-        url = f"{self.url}/Items/{item_id}"
-        
-        try:
-            # Get current metadata
-            response = requests.get(url, headers=self.headers, params={"userId": user_id})
-            response.raise_for_status()
-            data = response.json()
-            
-            # Check if update is needed - normalize to strings for comparison
-            current_custom = self._normalize_rating_value(data.get(CUSTOM_RATING_FIELD))
-            new_custom = self._normalize_rating_value(commonsense_rating)
-            
-            if new_custom is not None and current_custom != new_custom:
-                data[CUSTOM_RATING_FIELD] = commonsense_rating
-                response = requests.post(url, headers=self.headers, json=data)
-                response.raise_for_status()
-                return True, True
-            else:
-                return True, False
-            
-        except requests.RequestException as e:
-            logger.error(f"Failed to update Common Sense rating for item {item_id}: {e}")
-            return False, False
-    
-    @staticmethod
-    def _normalize_rating_value(value) -> Optional[str]:
-        """Normalize rating values for consistent comparison"""
-        if value is None:
-            return None
-        # Convert to string and strip whitespace
-        normalized = str(value).strip()
-        # Return None for empty strings to treat them as None
-        return normalized if normalized else None
 
 
 class MDBListAPI:
@@ -224,8 +88,35 @@ class MDBListAPI:
             return {}
 
 
+class CommonSenseFilter(MediaFilter):
+    """Filter to identify media items that need Common Sense rating updates"""
+    
+    def __init__(self, ratings_data: Dict[str, CommonSenseRating], 
+                 provider_filter: ProviderIDFilter):
+        self.ratings_data = ratings_data
+        self.provider_filter = provider_filter
+    
+    def should_include(self, media_item: MediaItem) -> bool:
+        """Include items that have provider IDs and available Common Sense ratings"""
+        if not self.provider_filter.should_include(media_item):
+            return False
+        
+        # Get the best provider ID for this item
+        provider, external_id = self.provider_filter.get_best_provider_id(media_item)
+        if not external_id:
+            return False
+        
+        # Check if we have rating data for this ID
+        return external_id in self.ratings_data
+
+
 class CommonSenseProcessor:
-    """Handles Common Sense rating processing"""
+    """Handles Common Sense rating processing and updates"""
+    
+    def __init__(self, media_library: MediaLibrary, mdblist_api: MDBListAPI):
+        self.media_library = media_library
+        self.mdblist_api = mdblist_api
+        self.provider_filter = ProviderIDFilter()
     
     @staticmethod
     def chunk_list(items: List[str], chunk_size: int) -> Generator[List[str], None, None]:
@@ -233,18 +124,24 @@ class CommonSenseProcessor:
         for i in range(0, len(items), chunk_size):
             yield items[i:i + chunk_size]
     
-    def get_all_commonsense_ratings(self, media: Dict[str, MediaData], 
-                                   mdb_api: MDBListAPI) -> Dict[str, CommonSenseRating]:
-        """Fetch Common Sense Media ratings for all media"""
-        # Group media by provider and type
+    def get_media_with_provider_ids(self) -> List[MediaItem]:
+        """Get all movies and series that have provider IDs"""
+        return self.media_library.get_movies_and_series(require_provider_ids=True)
+    
+    def group_media_by_provider(self, media_items: List[MediaItem]) -> Dict[str, Dict[MediaType, List[str]]]:
+        """Group media items by provider and media type for batch processing"""
         grouped_data = defaultdict(lambda: defaultdict(list))
         
-        for media_item in media.values():
-            provider = media_item.provider
-            media_type = media_item.media_type
-            external_id = media_item.external_id
-            grouped_data[provider][media_type].append(external_id)
+        for media_item in media_items:
+            provider, external_id = self.provider_filter.get_best_provider_id(media_item)
+            if provider and external_id:
+                grouped_data[provider][media_item.media_type].append(external_id)
         
+        return grouped_data
+    
+    def fetch_all_commonsense_ratings(self, media_items: List[MediaItem]) -> Dict[str, CommonSenseRating]:
+        """Fetch Common Sense Media ratings for all media items"""
+        grouped_data = self.group_media_by_provider(media_items)
         all_ratings = {}
         
         for provider, media_types in grouped_data.items():
@@ -254,27 +151,95 @@ class CommonSenseProcessor:
                 
                 # Process in batches to avoid API limits
                 for chunk in self.chunk_list(ids, BATCH_SIZE):
-                    ratings = mdb_api.get_commonsense_ratings_batch(provider, media_type, chunk)
+                    ratings = self.mdblist_api.get_commonsense_ratings_batch(provider, media_type, chunk)
                     all_ratings.update(ratings)
                     
                     if len(chunk) == BATCH_SIZE:  # Only delay if we're making multiple requests
                         time.sleep(REQUEST_DELAY)
         
         return all_ratings
+    
+    def update_commonsense_ratings(self, media_items: List[MediaItem], 
+                                  ratings_data: Dict[str, CommonSenseRating]) -> Dict[str, any]:
+        """Update Common Sense ratings for media items and return statistics"""
+        stats = {
+            'successful_updates': 0,
+            'skipped_updates': 0,
+            'failed_updates': 0,
+            'rated_media': [],
+            'missing_rating_media': []
+        }
+        
+        for media_item in media_items:
+            provider, external_id = self.provider_filter.get_best_provider_id(media_item)
+            if not external_id:
+                continue
+            
+            rating_info = ratings_data.get(external_id, CommonSenseRating())
+            
+            # Update Common Sense rating in Jellyfin (using custom rating field)
+            success, was_updated = self.media_library.api.update_custom_rating(
+                media_item.id, 
+                self.media_library.primary_user.id,
+                rating_info.age_rating
+            )
+            
+            # Update statistics
+            if success:
+                if was_updated:
+                    stats['successful_updates'] += 1
+                else:
+                    stats['skipped_updates'] += 1
+            else:
+                stats['failed_updates'] += 1
+            
+            # Create log entry
+            update_status = self._get_update_status(success, was_updated)
+            log_entry = self._create_log_entry(
+                media_item, provider, external_id, rating_info, update_status
+            )
+            
+            # Categorize for logging
+            if rating_info.age_rating:
+                stats['rated_media'].append(log_entry)
+            else:
+                stats['missing_rating_media'].append(log_entry)
+            
+            # Log individual entries for updates or failures, not skips
+            if was_updated or not success:
+                logger.info(log_entry)
+        
+        return stats
+    
+    def _get_update_status(self, success: bool, was_updated: bool) -> str:
+        """Get status string for update operation"""
+        if success:
+            return " [UPDATED]" if was_updated else " [SKIPPED - No Changes]"
+        else:
+            return " [FAILED]"
+    
+    def _create_log_entry(self, media_item: MediaItem, provider: str, external_id: str,
+                         rating_info: CommonSenseRating, update_status: str) -> str:
+        """Create formatted log entry for media item update"""
+        return (
+            f"{media_item.name} ({media_item.media_type.value}) ({provider}:{external_id}) -> "
+            f"Common Sense: {media_item.custom_rating or 'N/A'} -> {rating_info.age_rating or 'N/A'}"
+            f"{update_status}"
+        )
 
 
-def write_log_file(rated_media: List[str], missing_ratings: List[str], missing_ids: List[str]):
+def write_log_file(stats: Dict[str, any], missing_ids_media: List[str]):
     """Write summary log file for Common Sense ratings"""
     try:
         with open(LOG_FILE, "w", encoding="utf-8") as f:
             f.write("=== Media with Common Sense Ratings Updated ===\n")
-            f.write("\n".join(rated_media) + "\n\n")
+            f.write("\n".join(stats['rated_media']) + "\n\n")
             
             f.write("=== Media with Missing Common Sense Ratings ===\n")
-            f.write("\n".join(missing_ratings) + "\n\n")
+            f.write("\n".join(stats['missing_rating_media']) + "\n\n")
             
             f.write("=== Media with No Usable External ID ===\n")
-            f.write("\n".join(missing_ids) + "\n")
+            f.write("\n".join(missing_ids_media) + "\n")
         
         logger.info(f"Common Sense ratings log file written to: {LOG_FILE}")
     except IOError as e:
@@ -284,96 +249,60 @@ def write_log_file(rated_media: List[str], missing_ratings: List[str], missing_i
 def main():
     """Main execution function for Common Sense rating updates"""
     try:
-        # Initialize APIs and processors
-        jellyfin = JellyfinAPI(JELLYFIN_URL, JELLYFIN_API_KEY)
-        mdblist = MDBListAPI(MDBLIST_API_KEY)
-        processor = CommonSenseProcessor()
+        # Initialize MediaLibrary and APIs
+        logger.info("Initializing Jellyfin connection...")
+        media_library = create_media_library(JELLYFIN_URL, JELLYFIN_API_KEY)
+        mdblist_api = MDBListAPI(MDBLIST_API_KEY)
+        processor = CommonSenseProcessor(media_library, mdblist_api)
         
-        # Get user and media
-        logger.info("Getting user ID...")
-        user_id = jellyfin.get_user_id()
-        
-        # Define which media types to process
-        media_types = [MediaType.MOVIE, MediaType.SERIES]
-        
+        # Get all media with provider IDs
         logger.info("Fetching media from Jellyfin...")
-        media, missing_id_media = jellyfin.get_all_media(user_id, media_types)
+        media_with_ids = processor.get_media_with_provider_ids()
+        
+        # Also get media without provider IDs for reporting
+        all_media = media_library.get_movies_and_series(require_provider_ids=False)
+        missing_ids_media = [
+            f"{item.name} ({item.media_type.value})" 
+            for item in all_media 
+            if not any(pid in item.provider_ids for pid in ProviderIDFilter.PROVIDER_PRIORITY)
+        ]
         
         # Count by type for reporting
-        movies = sum(1 for m in media.values() if m.media_type == MediaType.MOVIE)
-        series = sum(1 for m in media.values() if m.media_type == MediaType.SERIES)
+        movies = sum(1 for m in media_with_ids if m.media_type == MediaType.MOVIE)
+        series = sum(1 for m in media_with_ids if m.media_type == MediaType.SERIES)
         
         logger.info(f"Found {movies} movies and {series} TV series with usable IDs")
-        logger.info(f"Found {len(missing_id_media)} items without usable IDs")
+        logger.info(f"Found {len(missing_ids_media)} items without usable IDs")
         
-        if not media:
+        if not media_with_ids:
             logger.warning("No media found with usable provider IDs")
             return
         
         # Get Common Sense ratings from MDBList
         logger.info("Fetching Common Sense ratings from MDBList...")
-        ratings = processor.get_all_commonsense_ratings(media, mdblist)
-        logger.info(f"Retrieved Common Sense ratings for {len(ratings)} items")
+        ratings_data = processor.fetch_all_commonsense_ratings(media_with_ids)
+        logger.info(f"Retrieved Common Sense ratings for {len(ratings_data)} items")
         
         # Process and update media
-        rated_media = []
-        missing_rating_media = []
-        successful_updates = 0
-        skipped_updates = 0
-        
-        for media_item in media.values():
-            rating_info = ratings.get(media_item.external_id, CommonSenseRating())
-            
-            # Update Common Sense rating in Jellyfin (only if value changed)
-            success, was_updated = jellyfin.update_commonsense_rating(
-                media_item.id, user_id, 
-                commonsense_rating=rating_info.age_rating
-            )
-            
-            if success:
-                if was_updated:
-                    successful_updates += 1
-                else:
-                    skipped_updates += 1
-            
-            # Create log entry
-            update_status = ""
-            if success:
-                if was_updated:
-                    update_status = " [UPDATED]"
-                else:
-                    update_status = " [SKIPPED - No Changes]"
-            else:
-                update_status = " [FAILED]"
-            
-            media_type_str = media_item.media_type.value
-            log_entry = (
-                f"{media_item.name} ({media_type_str}) ({media_item.provider}:{media_item.external_id}) -> "
-                f"Common Sense: {media_item.custom_rating or 'N/A'} -> {rating_info.age_rating or 'N/A'}"
-                f"{update_status}"
-            )
-            
-            if rating_info.age_rating:
-                rated_media.append(log_entry)
-            else:
-                missing_rating_media.append(log_entry)
-            
-            # Only log individual entries for updates or failures, not skips
-            if was_updated or not success:
-                logger.info(log_entry)
+        logger.info("Updating Common Sense ratings in Jellyfin...")
+        stats = processor.update_commonsense_ratings(media_with_ids, ratings_data)
         
         # Write log file and summary
-        write_log_file(rated_media, missing_rating_media, missing_id_media)
+        write_log_file(stats, missing_ids_media)
         
+        # Print summary
         logger.info("\n=== COMMON SENSE RATINGS SUMMARY ===")
-        logger.info(f"Successfully updated: {successful_updates}")
-        logger.info(f"Skipped (no changes needed): {skipped_updates}")
-        logger.info(f"Failed updates: {len(media) - successful_updates - skipped_updates}")
-        logger.info(f"Items with Common Sense ratings: {len(rated_media)}")
-        logger.info(f"Items missing Common Sense ratings: {len(missing_rating_media)}")
-        logger.info(f"Items without provider IDs: {len(missing_id_media)}")
-        logger.info(f"Total processing efficiency: {skipped_updates}/{len(media)} items already had correct values")
+        logger.info(f"Successfully updated: {stats['successful_updates']}")
+        logger.info(f"Skipped (no changes needed): {stats['skipped_updates']}")
+        logger.info(f"Failed updates: {stats['failed_updates']}")
+        logger.info(f"Items with Common Sense ratings: {len(stats['rated_media'])}")
+        logger.info(f"Items missing Common Sense ratings: {len(stats['missing_rating_media'])}")
+        logger.info(f"Items without provider IDs: {len(missing_ids_media)}")
+        logger.info(f"Total processing efficiency: {stats['skipped_updates']}/{len(media_with_ids)} items already had correct values")
         
+    except JellyfinAPIError as e:
+        logger.error(f"Jellyfin API error: {e}")
+        raise
     except Exception as e:
         logger.error(f"Common Sense rating script failed with error: {e}")
         raise
